@@ -62,6 +62,10 @@ data class MainUiState(
     // Download
     val downloadedArtifacts: List<DownloadedArtifact> = emptyList(),
     val artifacts: List<BuildArtifact> = emptyList(),
+    val prebuiltGkiReleases: List<PrebuiltGkiRelease> = emptyList(),
+    val isLoadingPrebuiltGkiReleases: Boolean = false,
+    val prebuiltGkiAssetsByReleaseId: Map<Long, List<PrebuiltGkiAsset>> = emptyMap(),
+    val loadingPrebuiltGkiAssetReleaseIds: Set<Long> = emptySet(),
     val isDownloading: Boolean = false,
     val downloadProgress: Map<Long, Int> = emptyMap(),
     val pendingAutoDownloadRunId: Long = -1L,
@@ -72,7 +76,8 @@ data class MainUiState(
     val autoDownload: Boolean = true,
     val notifyBuild: Boolean = true,
     val themeMode: String = "dark",
-    val downloadMirrorBaseUrl: String = ""
+    val downloadMirrorBaseUrl: String = "",
+    val prebuiltGkiEnabled: Boolean = true
 )
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -185,6 +190,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             prefs.downloadMirrorBaseUrl.collect { url ->
                 _uiState.update { it.copy(downloadMirrorBaseUrl = url) }
+            }
+        }
+        viewModelScope.launch {
+            prefs.prebuiltGkiEnabled.collect { enabled ->
+                _uiState.update {
+                    if (enabled) {
+                        it.copy(prebuiltGkiEnabled = true)
+                    } else {
+                        it.copy(
+                            prebuiltGkiEnabled = false,
+                            prebuiltGkiReleases = emptyList(),
+                            isLoadingPrebuiltGkiReleases = false,
+                            prebuiltGkiAssetsByReleaseId = emptyMap(),
+                            loadingPrebuiltGkiAssetReleaseIds = emptySet()
+                        )
+                    }
+                }
             }
         }
         viewModelScope.launch {
@@ -388,7 +410,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     autoDownload = it.autoDownload,
                     notifyBuild = it.notifyBuild,
                     themeMode = it.themeMode,
-                    downloadMirrorBaseUrl = it.downloadMirrorBaseUrl
+                    downloadMirrorBaseUrl = it.downloadMirrorBaseUrl,
+                    prebuiltGkiEnabled = it.prebuiltGkiEnabled
                 )
             }
         }
@@ -744,6 +767,107 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         startArtifactDownload(artifact)
     }
 
+    fun loadPrebuiltGkiReleases(force: Boolean = false) {
+        val state = _uiState.value
+        if (!state.prebuiltGkiEnabled || !state.isLoggedIn) return
+        if (state.isLoadingPrebuiltGkiReleases || (!force && state.prebuiltGkiReleases.isNotEmpty())) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoadingPrebuiltGkiReleases = true, error = null) }
+            val result = github.listReleases(BuildConfig.SOURCE_REPO_OWNER, BuildConfig.SOURCE_REPO_NAME)
+            if (!_uiState.value.prebuiltGkiEnabled) {
+                _uiState.update { it.copy(isLoadingPrebuiltGkiReleases = false) }
+                return@launch
+            }
+            when (result) {
+                is Result.Success -> {
+                    val releases = result.data
+                        .map(::prebuiltGkiReleaseFromGitHub)
+                        .distinctBy { it.id }
+                        .sortedWith(prebuiltGkiReleaseComparator())
+                    _uiState.update {
+                        it.copy(
+                            prebuiltGkiReleases = releases,
+                            isLoadingPrebuiltGkiReleases = false
+                        )
+                    }
+                }
+                is Result.Error -> _uiState.update {
+                    it.copy(isLoadingPrebuiltGkiReleases = false, error = "获取预编译 GKI Release 失败: ${result.message}")
+                }
+                else -> _uiState.update { it.copy(isLoadingPrebuiltGkiReleases = false) }
+            }
+        }
+    }
+
+    fun loadPrebuiltGkiAssets(release: PrebuiltGkiRelease, force: Boolean = false) {
+        val state = _uiState.value
+        if (!state.prebuiltGkiEnabled || !state.isLoggedIn) return
+        if (release.id in state.loadingPrebuiltGkiAssetReleaseIds) return
+        if (!force && state.prebuiltGkiAssetsByReleaseId.containsKey(release.id)) return
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    error = null,
+                    loadingPrebuiltGkiAssetReleaseIds = it.loadingPrebuiltGkiAssetReleaseIds + release.id
+                )
+            }
+            val result = if (release.apiId > 0L) {
+                github.listReleaseAssets(BuildConfig.SOURCE_REPO_OWNER, BuildConfig.SOURCE_REPO_NAME, release.apiId)
+            } else {
+                when (val fallback = github.getReleaseByTag(
+                    BuildConfig.SOURCE_REPO_OWNER,
+                    BuildConfig.SOURCE_REPO_NAME,
+                    release.tagName
+                )) {
+                    is Result.Success -> Result.Success(fallback.data?.assets.orEmpty())
+                    is Result.Error -> fallback
+                    Result.Loading -> Result.Loading
+                }
+            }
+            if (!_uiState.value.prebuiltGkiEnabled) {
+                _uiState.update {
+                    it.copy(loadingPrebuiltGkiAssetReleaseIds = it.loadingPrebuiltGkiAssetReleaseIds - release.id)
+                }
+                return@launch
+            }
+            when (result) {
+                is Result.Success -> {
+                    val assets = prebuiltGkiAssetsFromReleaseAssets(release, result.data)
+                        .filter(::isPrebuiltGkiCandidate)
+                        .distinctBy { it.id }
+                        .sortedWith(prebuiltGkiComparator(_uiState.value.recommendedBuildConfig))
+                    _uiState.update {
+                        it.copy(
+                            prebuiltGkiAssetsByReleaseId = it.prebuiltGkiAssetsByReleaseId + (release.id to assets),
+                            loadingPrebuiltGkiAssetReleaseIds = it.loadingPrebuiltGkiAssetReleaseIds - release.id
+                        )
+                    }
+                }
+                is Result.Error -> _uiState.update {
+                    it.copy(
+                        loadingPrebuiltGkiAssetReleaseIds = it.loadingPrebuiltGkiAssetReleaseIds - release.id,
+                        error = "获取 ${release.name} 资产失败: ${result.message}"
+                    )
+                }
+                Result.Loading -> _uiState.update {
+                    it.copy(loadingPrebuiltGkiAssetReleaseIds = it.loadingPrebuiltGkiAssetReleaseIds - release.id)
+                }
+            }
+        }
+    }
+
+    fun downloadPrebuiltGki(asset: PrebuiltGkiAsset) {
+        val key = DownloadUtils.prebuiltProgressKey(asset.id)
+        artifactDownloadJobs[key]?.cancel()
+        artifactDownloadJobs[key] = viewModelScope.launch {
+            try {
+                downloadPrebuiltGkiNow(asset, key)
+            } finally {
+                artifactDownloadJobs.remove(key)
+            }
+        }
+    }
+
     fun deleteDownloadedArtifact(filePath: String) {
         viewModelScope.launch {
             val current = _uiState.value.downloadedArtifacts
@@ -829,6 +953,54 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } finally {
                 artifactDownloadJobs.remove(artifact.id)
             }
+        }
+    }
+
+    private suspend fun downloadPrebuiltGkiNow(asset: PrebuiltGkiAsset, progressKey: Long) {
+        if (!_uiState.value.prebuiltGkiEnabled) return
+        val token = prefs.accessToken.first()
+        _uiState.update {
+            it.copy(
+                isDownloading = true,
+                error = null,
+                downloadProgress = it.downloadProgress + (progressKey to 0)
+            )
+        }
+        NotificationUtils.notifyDownloadProgress(getApplication(), 0, asset.name)
+        val results = DownloadUtils.downloadDirectAsset(
+            getApplication(),
+            token,
+            asset.browserDownloadUrl,
+            asset.name,
+            asset.sizeBytes,
+            PREBUILT_GKI_RUN_ID,
+            "预编译 GKI"
+        ) { pct ->
+            NotificationUtils.notifyDownloadProgress(getApplication(), pct, asset.name)
+            _uiState.update { s ->
+                s.copy(downloadProgress = s.downloadProgress + (progressKey to pct))
+            }
+        }
+        if (!_uiState.value.prebuiltGkiEnabled) {
+            _uiState.update { it.copy(isDownloading = false, downloadProgress = it.downloadProgress - progressKey) }
+            return
+        }
+        if (results.isNotEmpty()) {
+            NotificationUtils.notifyDownloadDone(getApplication(), asset.name)
+            val updated = (_uiState.value.downloadedArtifacts + results)
+                .distinctBy { it.filePath }
+                .sortedDownloadedForDisplay()
+            _uiState.update { s ->
+                s.copy(
+                    isDownloading = false,
+                    error = null,
+                    downloadedArtifacts = updated,
+                    downloadProgress = s.downloadProgress - progressKey
+                )
+            }
+            prefs.saveDownloadedArtifactsJson(gson.toJson(updated))
+        } else {
+            finishArtifactDownloadWithError(progressKey, "下载预编译 GKI 失败: ${asset.name}")
         }
     }
 
@@ -1150,6 +1322,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun setDownloadMirrorBaseUrl(url: String) = viewModelScope.launch {
         prefs.setDownloadMirrorBaseUrl(url.trim())
     }
+    fun setPrebuiltGkiEnabled(v: Boolean) = viewModelScope.launch {
+        if (!v) {
+            artifactDownloadJobs.keys.filter { it < 0L }.forEach { key ->
+                artifactDownloadJobs[key]?.cancel()
+                artifactDownloadJobs.remove(key)
+            }
+        }
+        _uiState.update {
+            if (v) it.copy(prebuiltGkiEnabled = true) else it.copy(
+                prebuiltGkiEnabled = false,
+                prebuiltGkiReleases = emptyList(),
+                isLoadingPrebuiltGkiReleases = false,
+                prebuiltGkiAssetsByReleaseId = emptyMap(),
+                loadingPrebuiltGkiAssetReleaseIds = emptySet(),
+                downloadProgress = it.downloadProgress.filterKeys { key -> key >= 0L }
+            )
+        }
+        prefs.setPrebuiltGkiEnabled(v)
+    }
     fun updateBuildConfig(config: KernelBuildConfig) {
         val normalized = KernelSupport.normalize(config)
         hasSavedBuildConfig = true
@@ -1187,6 +1378,81 @@ private fun detectRecommendedBuildConfig(): KernelBuildConfig? {
     return KernelSupport.recommendedFromKernel(kernelVersion)
 }
 
+private fun prebuiltGkiReleaseFromGitHub(release: GitHubReleaseSummary): PrebuiltGkiRelease {
+    val fallbackId = release.tagName.hashCode().toLong().let { if (it < 0) -it else it }
+    return PrebuiltGkiRelease(
+        id = if (release.id != 0L) release.id else fallbackId,
+        apiId = release.id,
+        tagName = release.tagName,
+        name = release.name?.takeIf { it.isNotBlank() } ?: release.tagName,
+        htmlUrl = release.htmlUrl,
+        publishedAt = release.publishedAt.orEmpty(),
+        body = release.body.orEmpty(),
+        assetCount = 0
+    )
+}
+
+private fun prebuiltGkiAssetsFromReleaseAssets(
+    release: PrebuiltGkiRelease,
+    assets: List<ReleaseAsset>
+): List<PrebuiltGkiAsset> =
+    assets.map { asset ->
+        val fallbackId = "${release.tagName}/${asset.name}".hashCode().toLong().let {
+            if (it < 0) -it else it
+        }
+        PrebuiltGkiAsset(
+            id = if (asset.id != 0L) asset.id else fallbackId,
+            name = asset.name,
+            sizeBytes = asset.size,
+            browserDownloadUrl = asset.browserDownloadUrl,
+            contentType = asset.contentType,
+            releaseTag = release.tagName,
+            releaseName = release.name,
+            releaseHtmlUrl = release.htmlUrl,
+            publishedAt = release.publishedAt,
+            releaseBody = release.body
+        )
+    }
+
+private fun prebuiltGkiReleaseComparator(): Comparator<PrebuiltGkiRelease> =
+    compareByDescending<PrebuiltGkiRelease> { it.publishedAt }
+        .thenBy { it.name }
+
+private fun isPrebuiltGkiCandidate(asset: PrebuiltGkiAsset): Boolean {
+    val lower = asset.name.lowercase()
+    val type = DownloadUtils.classifyArtifact(asset.name)
+    return type in setOf(ArtifactType.KERNEL_PACKAGE, ArtifactType.KERNEL_IMG, ArtifactType.ANYKERNEL3) ||
+        ((lower.endsWith(".img") || lower.endsWith(".zip")) &&
+            listOf("gki", "kernel", "boot", "anykernel", "ak3").any { lower.contains(it) })
+}
+
+private fun prebuiltGkiComparator(
+    recommended: KernelBuildConfig?
+): Comparator<PrebuiltGkiAsset> =
+    compareByDescending<PrebuiltGkiAsset> { prebuiltRecommendationScore(it, recommended) }
+        .thenByDescending { it.publishedAt }
+        .thenBy { it.name }
+
+private fun prebuiltRecommendationScore(asset: PrebuiltGkiAsset, recommended: KernelBuildConfig?): Int {
+    recommended ?: return 0
+    if (recommended.subLevel == "X") return 0
+    val haystack = listOf(asset.name, asset.releaseTag, asset.releaseName, asset.releaseBody)
+        .joinToString(" ")
+        .lowercase()
+        .replace('_', '-')
+    val kernelSub = Regex(
+        """(^|[^0-9])${Regex.escape(recommended.kernelVersion)}[.-]?${Regex.escape(recommended.subLevel)}([^0-9]|$)"""
+    ).containsMatchIn(haystack)
+    if (!kernelSub) return 0
+
+    val androidNumber = recommended.androidVersion.removePrefix("android")
+    val hasAndroid = haystack.contains(recommended.androidVersion.lowercase()) ||
+        haystack.contains("android-$androidNumber") ||
+        haystack.contains("a$androidNumber")
+    val hasPatch = recommended.osPatchLevel.isNotBlank() && haystack.contains(recommended.osPatchLevel.lowercase())
+    return 10 + (if (hasAndroid) 5 else 0) + (if (hasPatch) 8 else 0)
+}
+
 private fun WorkflowRun.isActiveBuildRun(): Boolean =
     status in setOf("queued", "waiting", "requested", "pending", "in_progress")
 
@@ -1221,7 +1487,7 @@ private fun KernelBuildConfig.toInputMap(): Map<String, String> = mapOf(
     "zram_full_algo" to zramFullAlgo.toString(),
     "zram_extra_algos" to zramExtraAlgos,
     "kpm_password" to kpmPassword,
-    "droidspaces" to droidspaces,
+    "virtualization_support" to virtualizationSupport,
     "use_custom_external_modules" to useCustomExternalModules.toString(),
     "custom_external_modules" to if (useCustomExternalModules) customExternalModules.toWorkflowInput() else ""
 )

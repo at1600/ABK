@@ -115,6 +115,14 @@ fun SettingsScreen(vm: MainViewModel) {
                     checked = state.autoDownload,
                     onCheckedChange = { vm.setAutoDownload(it) }
                 )
+                HorizontalDivider()
+                SwitchSettingsItem(
+                    icon = Icons.Default.CloudDownload,
+                    title = "预编译 GKI 获取与下载",
+                    subtitle = "从本仓库 Release 获取预编译 GKI，下载需手动触发",
+                    checked = state.prebuiltGkiEnabled,
+                    onCheckedChange = { vm.setPrebuiltGkiEnabled(it) }
+                )
                 Spacer(Modifier.height(10.dp))
                 MirrorSettingsItem(
                     value = state.downloadMirrorBaseUrl,
@@ -283,6 +291,7 @@ private fun aboutLinks(): List<AboutLink> {
         ),
         AboutLink("Baseband Guard", "https://github.com/vc-teahouse/Baseband-guard"),
         AboutLink("Re-Kernel", "https://github.com/Sakion-Team/Re-Kernel"),
+        AboutLink("Droidspaces / 虚拟化支持补丁来源", "https://github.com/ravindu644/Droidspaces-OSS"),
         AboutLink("KernelSU 官方站点", "https://kernelsu.org/")
     )
 }
