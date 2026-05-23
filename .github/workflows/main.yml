@@ -40,7 +40,6 @@ on:
           - SukiSU
           - ReSukiSU
           - Official
-          #- Next
         default: ReSukiSU
       kernelsu_branch:
         description: "KSU 分支"
@@ -349,7 +348,6 @@ jobs:
         run: |
           # KSU 显示名称
           case "${{ inputs.kernelsu_variant }}" in
-            "Next")      KSU_NAME="KernelSU-Next" ;;
             "Official")  KSU_NAME="KernelSU" ;;
             "SukiSU")    KSU_NAME="SukiSU" ;;
             "ReSukiSU")  KSU_NAME="ReSukiSU" ;;
@@ -426,7 +424,6 @@ jobs:
           case "${{ inputs.kernelsu_variant }}" in
             "Official") BRANCH="main" ;;
             "SukiSU"|"ReSukiSU") BRANCH="main" ;;
-            "Next") BRANCH="dev" ;;
             *) echo "错误: 未知变体" >&2; exit 1 ;;
           esac
           echo "KSU_BRANCH=$BRANCH" >> $GITHUB_ENV
@@ -437,20 +434,43 @@ jobs:
         run: |
           case "${{ inputs.kernelsu_variant }}" in
             "Official") REPO_URL="https://github.com/tiann/KernelSU.git"; REPO_URL2="tiann/KernelSU" ;;
-            "Next") REPO_URL="https://github.com/KernelSU-Next/KernelSU-Next.git"; REPO_URL2="KernelSU-Next/KernelSU-Next" ;;
             "SukiSU") REPO_URL="https://github.com/SukiSU-Ultra/SukiSU-Ultra.git"; REPO_URL2="SukiSU-Ultra/SukiSU-Ultra" ;;
             "ReSukiSU") REPO_URL="https://github.com/ReSukiSU/ReSukiSU.git"; REPO_URL2="ReSukiSU/ReSukiSU" ;;
           esac
 
-          if [[ "${{ inputs.kernelsu_branch }}" == "Stable(标准)" ]]; then
-            TAG=$(git ls-remote --tags --sort=-v:refname $REPO_URL | grep -o 'refs/tags/.*' | cut -d'/' -f3 | head -n1)
-            KSU_REF=$TAG
-            KSU_URL="https://github.com/$REPO_URL2/releases/tag/$TAG"
-          else
-            COMMIT_HASH=$(git ls-remote $REPO_URL refs/heads/${KSU_BRANCH:-main} | awk '{ print $1 }')
-            KSU_REF=$COMMIT_HASH
-            KSU_URL="https://github.com/$REPO_URL2/commit/$COMMIT_HASH"
+          branch_input="${{ inputs.kernelsu_branch }}"
+          if [[ "$branch_input" == "SUSFS(自动)" ]]; then
+            branch_input="Stable(标准)"
           fi
+
+          OFFICIAL_STABLE_REF="3f388ef137c78e1ca0c92c0ada3b8717cdcc4302"
+          SUKISU_STABLE_REF="c5af9eadac43b1f0b9751471be78e6eef681554b"
+          RESUKISU_STABLE_REF="3d790eaaabe9e7e33d938bbf836e0f247121e79e"
+
+          OFFICIAL_DEV_REF="$OFFICIAL_STABLE_REF"
+          SUKISU_DEV_REF="$SUKISU_STABLE_REF"
+          RESUKISU_DEV_REF="$RESUKISU_STABLE_REF"
+
+          case "$branch_input" in
+            "Stable(标准)")
+              OFFICIAL_REF="$OFFICIAL_STABLE_REF"
+              SUKISU_REF="$SUKISU_STABLE_REF"
+              RESUKISU_REF="$RESUKISU_STABLE_REF"
+              ;;
+            "Dev(开发)")
+              OFFICIAL_REF="$OFFICIAL_DEV_REF"
+              SUKISU_REF="$SUKISU_DEV_REF"
+              RESUKISU_REF="$RESUKISU_DEV_REF"
+              ;;
+            *) echo "错误: 未知 KSU 分支 $branch_input" >&2; exit 1 ;;
+          esac
+
+          case "${{ inputs.kernelsu_variant }}" in
+            "Official") KSU_REF="$OFFICIAL_REF"; KSU_URL="https://github.com/$REPO_URL2/commit/$KSU_REF" ;;
+            "SukiSU") KSU_REF="$SUKISU_REF"; KSU_URL="https://github.com/$REPO_URL2/commit/$KSU_REF" ;;
+            "ReSukiSU") KSU_REF="$RESUKISU_REF"; KSU_URL="https://github.com/$REPO_URL2/commit/$KSU_REF" ;;
+            *) echo "错误: 未知变体" >&2; exit 1 ;;
+          esac
 
           echo "KSU_REF=$KSU_REF" >> $GITHUB_ENV
           echo "KSU_URL=$KSU_URL" >> $GITHUB_ENV

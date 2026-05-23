@@ -1,11 +1,7 @@
 package com.abk.kernel.utils
 
-import android.content.ActivityNotFoundException
-import android.content.ClipData
 import android.content.Context
-import android.content.Intent
-import android.os.Environment
-import androidx.core.content.FileProvider
+import com.abk.kernel.R
 import com.abk.kernel.data.model.Artifact
 import com.abk.kernel.data.model.ArtifactCategory
 import com.abk.kernel.data.model.ArtifactType
@@ -29,6 +25,11 @@ import java.util.zip.ZipInputStream
 object DownloadUtils {
 
     private val client = OkHttpClient.Builder().build()
+
+    data class DownloadResult(
+        val artifacts: List<DownloadedArtifact> = emptyList(),
+        val errorMessage: String? = null
+    )
 
     fun classifyArtifact(name: String): ArtifactType {
         val lower = name.lowercase()
@@ -115,9 +116,14 @@ object DownloadUtils {
         artifact: Artifact,
         run: WorkflowRun? = null,
         downloadUrl: String? = null,
+        downloadDirectoryPath: String? = null,
         onProgress: (Int) -> Unit = {}
-    ): List<DownloadedArtifact> = withContext(Dispatchers.IO) {
+    ): DownloadResult = withContext(Dispatchers.IO) {
         try {
+            val downloadsRoot = resolveDownloadsRoot(downloadDirectoryPath)
+                ?: return@withContext DownloadResult(
+                    errorMessage = downloadDirectoryErrorMessage(context, downloadDirectoryPath)
+                )
             val url = downloadUrl ?: artifact.archiveDownloadUrl
             val request = Request.Builder()
                 .url(url)
@@ -130,13 +136,11 @@ object DownloadUtils {
                 .build()
 
             val response = client.newCall(request).execute()
-            if (!response.isSuccessful) return@withContext emptyList()
+            if (!response.isSuccessful) return@withContext DownloadResult()
 
-            val body = response.body ?: return@withContext emptyList()
+            val body = response.body ?: return@withContext DownloadResult()
             val totalBytes = artifact.sizeInBytes.coerceAtLeast(1L)
 
-            val downloadsRoot = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-                ?: context.filesDir
             val runDir = File(downloadsRoot, runFolderName(run)).apply { mkdirs() }
             val zipFile = File(runDir, "${artifact.name}.zip")
 
@@ -161,22 +165,25 @@ object DownloadUtils {
             unzip(zipFile, outDir)
             zipFile.delete()
 
-            collectCandidateFiles(outDir).mapIndexed { index, file ->
-                val type = classifyDownloadedFile(file)
-                DownloadedArtifact(
-                    id = artifact.id * 1000 + index + 1,
-                    name = file.name,
-                    filePath = file.absolutePath,
-                    type = type,
-                    sizeBytes = file.length(),
-                    runId = run?.id ?: -1L,
-                    runTitle = run?.displayTitle ?: run?.name ?: run?.let { "#${it.runNumber}" } ?: "未关联工作流",
-                    runNumber = run?.runNumber ?: 0,
-                    category = type.toArtifactCategory()
-                )
-            }
+            DownloadResult(
+                artifacts = collectCandidateFiles(outDir).mapIndexed { index, file ->
+                    val type = classifyDownloadedFile(file)
+                    DownloadedArtifact(
+                        id = artifact.id * 1000 + index + 1,
+                        name = file.name,
+                        filePath = file.absolutePath,
+                        type = type,
+                        sizeBytes = file.length(),
+                        runId = run?.id ?: -1L,
+                        runTitle = run?.displayTitle ?: run?.name ?: run?.let { "#${it.runNumber}" }
+                            ?: context.getString(R.string.workflow_unlinked),
+                        runNumber = run?.runNumber ?: 0,
+                        category = type.toArtifactCategory()
+                    )
+                }
+            )
         } catch (e: Exception) {
-            emptyList()
+            DownloadResult()
         }
     }
 
@@ -188,9 +195,14 @@ object DownloadUtils {
         sizeBytes: Long,
         runId: Long,
         runTitle: String,
+        downloadDirectoryPath: String? = null,
         onProgress: (Int) -> Unit = {}
-    ): List<DownloadedArtifact> = withContext(Dispatchers.IO) {
+    ): DownloadResult = withContext(Dispatchers.IO) {
         try {
+            val downloadsRoot = resolveDownloadsRoot(downloadDirectoryPath)
+                ?: return@withContext DownloadResult(
+                    errorMessage = downloadDirectoryErrorMessage(context, downloadDirectoryPath)
+                )
             val request = Request.Builder()
                 .url(url)
                 .header("Accept", "application/octet-stream")
@@ -202,17 +214,15 @@ object DownloadUtils {
                 .build()
 
             val response = client.newCall(request).execute()
-            if (!response.isSuccessful) return@withContext emptyList()
+            if (!response.isSuccessful) return@withContext DownloadResult()
 
-            val body = response.body ?: return@withContext emptyList()
+            val body = response.body ?: return@withContext DownloadResult()
             val totalBytes = when {
                 sizeBytes > 0L -> sizeBytes
                 body.contentLength() > 0L -> body.contentLength()
                 else -> 1L
             }
 
-            val downloadsRoot = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-                ?: context.filesDir
             val assetDir = File(downloadsRoot, "prebuilt-gki/${safeFileName(name)}").apply {
                 if (exists()) deleteRecursively()
                 mkdirs()
@@ -244,22 +254,24 @@ object DownloadUtils {
                 listOf(file)
             }
 
-            files.mapIndexed { index, candidate ->
-                val type = classifyDownloadedFile(candidate)
-                DownloadedArtifact(
-                    id = runId * 1000 + index.toLong() + 1L,
-                    name = candidate.name,
-                    filePath = candidate.absolutePath,
-                    type = type,
-                    sizeBytes = candidate.length(),
-                    runId = runId,
-                    runTitle = runTitle,
-                    runNumber = 0,
-                    category = type.toArtifactCategory()
-                )
-            }
+            DownloadResult(
+                artifacts = files.mapIndexed { index, candidate ->
+                    val type = classifyDownloadedFile(candidate)
+                    DownloadedArtifact(
+                        id = runId * 1000 + index.toLong() + 1L,
+                        name = candidate.name,
+                        filePath = candidate.absolutePath,
+                        type = type,
+                        sizeBytes = candidate.length(),
+                        runId = runId,
+                        runTitle = runTitle,
+                        runNumber = 0,
+                        category = type.toArtifactCategory()
+                    )
+                }
+            )
         } catch (e: Exception) {
-            emptyList()
+            DownloadResult()
         }
     }
 
@@ -273,6 +285,31 @@ object DownloadUtils {
         value.replace(Regex("""[^A-Za-z0-9._ -]"""), "_")
             .trim()
             .ifBlank { "artifact" }
+
+    private fun resolveDownloadsRoot(downloadDirectoryPath: String?): File? {
+        val normalizedPath = DownloadDirectoryUtils.normalizeDirectoryPath(downloadDirectoryPath)
+        val directory = File(normalizedPath)
+        if (directory.exists()) {
+            return directory.takeIf { it.isDirectory && it.canWrite() }
+        }
+        if (!directory.mkdirs() && !directory.exists()) {
+            return null
+        }
+        return directory.takeIf { it.isDirectory && it.canWrite() }
+    }
+
+    private fun downloadDirectoryErrorMessage(context: Context, downloadDirectoryPath: String?): String {
+        val normalizedPath = DownloadDirectoryUtils.normalizeDirectoryPath(downloadDirectoryPath)
+        val directory = File(normalizedPath)
+        return when {
+            directory.exists() && !directory.isDirectory ->
+                context.getString(R.string.download_directory_not_directory, normalizedPath)
+            directory.exists() && !directory.canWrite() ->
+                context.getString(R.string.download_directory_not_writable, normalizedPath)
+            else ->
+                context.getString(R.string.download_directory_create_failed, normalizedPath)
+        }
+    }
 
     private fun unzip(zipFile: File, outDir: File) {
         val outCanonical = outDir.canonicalFile
@@ -345,49 +382,6 @@ object DownloadUtils {
             }
         }.getOrDefault(ArtifactType.OTHER)
     }
-
-    fun installApk(context: Context, filePath: String): Boolean {
-        val file = File(filePath)
-        if (!file.exists()) return false
-        return runCatching {
-            val uri = FileProvider.getUriForFile(
-                context, "${context.packageName}.fileprovider", file
-            )
-            val viewIntent = buildViewIntent(context, uri, "application/vnd.android.package-archive", file.name)
-            val installIntent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
-                data = uri
-                clipData = ClipData.newUri(context.contentResolver, file.name, uri)
-                putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            context.startActivitySafely(viewIntent) || context.startActivitySafely(installIntent)
-        }.getOrDefault(false)
-    }
-
-    private fun Context.startActivitySafely(intent: Intent): Boolean {
-        return try {
-            startActivity(intent)
-            true
-        } catch (_: ActivityNotFoundException) {
-            false
-        } catch (_: SecurityException) {
-            false
-        }
-    }
-
-    private fun buildViewIntent(
-        context: Context,
-        uri: android.net.Uri,
-        mimeType: String,
-        label: String
-    ): Intent =
-        Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, mimeType)
-            clipData = ClipData.newUri(context.contentResolver, label, uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
 
     fun formatSize(bytes: Long): String {
         return when {
