@@ -4,14 +4,8 @@ package com.abk.kernel.ui.screens
 
 import android.content.Context
 import android.widget.Toast
-import androidx.activity.compose.BackHandler
-import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
@@ -31,6 +25,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -61,7 +57,7 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
+import com.abk.kernel.ui.components.ShimmerLinearProgress
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -77,21 +73,19 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
@@ -102,40 +96,45 @@ import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 import com.abk.kernel.R
 import com.abk.kernel.data.model.CustomExternalModuleStage
+import com.abk.kernel.data.model.ExternalModuleMetadata
+import com.abk.kernel.data.model.ModuleCatalogItemKind
 import com.abk.kernel.data.model.ModuleCatalogItem
 import com.abk.kernel.data.model.ModuleCatalogRepository
 import com.abk.kernel.data.model.RuntimeModuleCatalogItem
 import com.abk.kernel.data.model.RuntimeModuleRepository
 import com.abk.kernel.ui.components.AbkScreenHorizontalPadding
+import com.abk.kernel.ui.components.AppPageBackground
+import com.abk.kernel.ui.components.ObserveChildPageVisibility
+import com.abk.kernel.ui.components.childPageOverlayEnterTransition
+import com.abk.kernel.ui.components.childPageOverlayExitTransition
+import com.abk.kernel.ui.components.childPageScrimExitTransition
+import com.abk.kernel.ui.components.rememberChildPageBackController
+import com.abk.kernel.ui.components.rememberChildPageOverlayTransition
 import com.abk.kernel.ui.components.ExpressiveSectionCard
 import com.abk.kernel.ui.components.ExpressiveStatusChip
 import com.abk.kernel.ui.components.ExpressiveTopBar
+import com.abk.kernel.ui.theme.appPageBackgroundColor
 import com.abk.kernel.ui.theme.uiSurfaceColor
 import com.abk.kernel.utils.LocaleHelper
 import com.abk.kernel.utils.DownloadUtils
 import com.abk.kernel.utils.RootUtils
 import com.abk.kernel.viewmodel.MainViewModel
 import java.io.File
-import kotlin.math.pow
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-private const val MODULE_REPOSITORY_BACK_VISUAL_EXPONENT = 1.8f
-private const val MODULE_REPOSITORY_BACK_SCALE_DELTA = 0.09f
-private const val MODULE_REPOSITORY_BACK_SCRIM_ALPHA = 0.32f
-private const val MODULE_REPOSITORY_PAGE_EXIT_DELAY_MS = 280L
 private const val RUNTIME_MODULE_DOWNLOAD_RUN_ID = -2_000_000_001L
-private val MODULE_REPOSITORY_BACK_MAX_OFFSET = 56.dp
-private val MODULE_REPOSITORY_BACK_MAX_CORNER = 32.dp
 
 enum class ModuleRepositoryMode {
     BUILD_ABK,
     RUNTIME_STANDARD
 }
+
+private data class ModuleListComputation<T>(
+    val items: List<T> = emptyList(),
+    val loading: Boolean = false
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -162,41 +161,76 @@ fun ModuleRepositoryScreen(
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(rememberTopAppBarState())
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var showRepositorySettings by rememberSaveable { mutableStateOf(false) }
+    val repositoryPageTransition = rememberChildPageOverlayTransition(
+        visible = showRepositorySettings,
+        label = "runtime-module-repository-settings"
+    )
     var pendingInstallModule by remember { mutableStateOf<MergedRuntimeCatalogModule?>(null) }
     var installDialogVisible by remember { mutableStateOf(false) }
     var installRunning by remember { mutableStateOf(false) }
     var installSuccess by remember { mutableStateOf<Boolean?>(null) }
     var installLog by remember { mutableStateOf<List<String>>(emptyList()) }
-    var repositoryBackProgress by remember { mutableFloatStateOf(0f) }
-    val animatedRepositoryBackProgress by animateFloatAsState(
-        targetValue = repositoryBackProgress.coerceIn(0f, 1f),
-        animationSpec = motionScheme.fastSpatialSpec(),
-        label = "module-repository-back-progress"
-    )
-    val visualRepositoryBackProgress = animatedRepositoryBackProgress
-        .coerceIn(0f, 1f)
-        .pow(MODULE_REPOSITORY_BACK_VISUAL_EXPONENT)
-    val density = LocalDensity.current
-    val repositoryBackOffsetPx = with(density) { MODULE_REPOSITORY_BACK_MAX_OFFSET.toPx() }
-    val repositoryBackCorner = with(density) {
-        (MODULE_REPOSITORY_BACK_MAX_CORNER.toPx() * visualRepositoryBackProgress).toDp()
+    val mergedModulesState by produceState(
+        initialValue = ModuleListComputation<MergedRuntimeCatalogModule>(
+            loading = state.runtimeModuleRepositories.isNotEmpty()
+        ),
+        key1 = state.runtimeModuleRepositories
+    ) {
+        if (state.runtimeModuleRepositories.isEmpty()) {
+            value = ModuleListComputation(items = emptyList(), loading = false)
+            return@produceState
+        }
+        value = ModuleListComputation(loading = true)
+        val merged = withContext(Dispatchers.Default) {
+            mergeRuntimeCatalogModules(state.runtimeModuleRepositories)
+        }
+        value = ModuleListComputation(items = merged, loading = false)
     }
-    val mergedModules = remember(state.runtimeModuleRepositories) {
-        mergeRuntimeCatalogModules(state.runtimeModuleRepositories)
+    val mergedModules = mergedModulesState.items
+    val filteredModulesState by produceState(
+        initialValue = ModuleListComputation<MergedRuntimeCatalogModule>(
+            loading = mergedModulesState.loading
+        ),
+        key1 = mergedModulesState,
+        key2 = searchQuery
+    ) {
+        if (mergedModulesState.loading) {
+            value = ModuleListComputation(loading = true)
+            return@produceState
+        }
+        value = ModuleListComputation(loading = true)
+        val filtered = withContext(Dispatchers.Default) {
+            if (searchQuery.isBlank()) {
+                mergedModules
+            } else {
+                mergedModules.filter { it.matchesQuery(searchQuery) }
+            }
+        }
+        value = ModuleListComputation(items = filtered, loading = false)
     }
-    val filteredModules = remember(mergedModules, searchQuery) {
-        mergedModules.filter { it.matchesQuery(searchQuery) }
-    }
-
-    fun openRepositorySettings() {
-        repositoryBackProgress = 0f
-        onRepositoryPageVisibleChange(true)
-        showRepositorySettings = true
-    }
+    val filteredModules = filteredModulesState.items
+    val listComputing = mergedModulesState.loading
 
     fun closeRepositorySettings() {
         showRepositorySettings = false
     }
+
+    val childPageBack = rememberChildPageBackController(
+        enabled = showRepositorySettings,
+        predictiveBackEnabled = state.predictiveBackEnabled,
+        onBack = ::closeRepositorySettings,
+    )
+
+    fun openRepositorySettings() {
+        childPageBack.resetProgress()
+        showRepositorySettings = true
+    }
+
+    ObserveChildPageVisibility(
+        transition = repositoryPageTransition,
+        onVisibleChange = onRepositoryPageVisibleChange,
+        onAfterExitAnimation = { childPageBack.resetProgress() }
+    )
 
     fun appendInstallLog(line: String) {
         installLog = installLog + line
@@ -274,33 +308,8 @@ fun ModuleRepositoryScreen(
         }
     }
 
-    LaunchedEffect(showRepositorySettings) {
-        if (showRepositorySettings) {
-            onRepositoryPageVisibleChange(true)
-        } else {
-            delay(MODULE_REPOSITORY_PAGE_EXIT_DELAY_MS)
-            repositoryBackProgress = 0f
-            onRepositoryPageVisibleChange(false)
-        }
-    }
-
     DisposableEffect(Unit) {
         onDispose { onRepositoryPageVisibleChange(false) }
-    }
-
-    PredictiveBackHandler(enabled = showRepositorySettings && state.predictiveBackEnabled) { progress ->
-        try {
-            progress.collect { backEvent ->
-                repositoryBackProgress = backEvent.progress.coerceIn(0f, 1f)
-            }
-            closeRepositorySettings()
-        } catch (_: CancellationException) {
-            repositoryBackProgress = 0f
-        }
-    }
-
-    BackHandler(enabled = showRepositorySettings && !state.predictiveBackEnabled) {
-        closeRepositorySettings()
     }
 
     pendingInstallModule?.let { merged ->
@@ -334,7 +343,7 @@ fun ModuleRepositoryScreen(
             .offset(y = -childPageTopInset)
 
         Scaffold(
-            containerColor = uiSurfaceColor(MaterialTheme.colorScheme.surface),
+            containerColor = appPageBackgroundColor(uiSurfaceColor(MaterialTheme.colorScheme.surface)),
             topBar = {
                 ExpressiveTopBar(
                     title = runtimeRepoTitleLabel(context),
@@ -354,6 +363,7 @@ fun ModuleRepositoryScreen(
                 padding = padding,
                 modules = filteredModules,
                 totalModules = mergedModules.size,
+                computing = listComputing,
                 repositories = state.runtimeModuleRepositories,
                 refreshing = state.refreshingRuntimeModuleRepositoryIds.isNotEmpty(),
                 searchQuery = searchQuery,
@@ -382,38 +392,29 @@ fun ModuleRepositoryScreen(
             )
         }
 
-        AnimatedVisibility(
-            visible = showRepositorySettings,
+        repositoryPageTransition.AnimatedVisibility(
+            visible = { it },
             enter = fadeIn(animationSpec = motionScheme.defaultEffectsSpec()),
-            exit = fadeOut(animationSpec = motionScheme.fastEffectsSpec()),
+            exit = childPageScrimExitTransition(state.predictiveBackEnabled, motionScheme),
             modifier = childPageModifier
         ) {
             Box(
                 Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = MODULE_REPOSITORY_BACK_SCRIM_ALPHA * visualRepositoryBackProgress))
+                    .background(Color.Black.copy(alpha = childPageBack.scrimAlpha))
             )
         }
 
-        AnimatedVisibility(
-            visible = showRepositorySettings,
-            enter = fadeIn(animationSpec = motionScheme.defaultEffectsSpec()) +
-                slideInHorizontally(animationSpec = motionScheme.defaultSpatialSpec()) { width -> width / 4 },
-            exit = fadeOut(animationSpec = motionScheme.fastEffectsSpec()) +
-                slideOutHorizontally(animationSpec = motionScheme.fastSpatialSpec()) { width -> width },
+        repositoryPageTransition.AnimatedVisibility(
+            visible = { it },
+            enter = childPageOverlayEnterTransition(state.predictiveBackEnabled, motionScheme),
+            exit = childPageOverlayExitTransition(state.predictiveBackEnabled, motionScheme),
             modifier = childPageModifier
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .graphicsLayer {
-                        translationX = repositoryBackOffsetPx * visualRepositoryBackProgress
-                        scaleX = 1f - MODULE_REPOSITORY_BACK_SCALE_DELTA * visualRepositoryBackProgress
-                        scaleY = 1f - MODULE_REPOSITORY_BACK_SCALE_DELTA * visualRepositoryBackProgress
-                        alpha = 1f - 0.06f * visualRepositoryBackProgress
-                        shape = RoundedCornerShape(repositoryBackCorner)
-                        clip = visualRepositoryBackProgress > 0.01f
-                    }
+                    .then(childPageBack.backTransformModifier())
             ) {
                 ModuleRepositoryPageBackground(
                     backgroundUri = state.customBackgroundUri,
@@ -425,7 +426,7 @@ fun ModuleRepositoryScreen(
                         ExpressiveTopBar(
                             title = runtimeRepoCentralLabel(context),
                             navigationIcon = {
-                                IconButton(onClick = ::closeRepositorySettings) {
+                                IconButton(onClick = childPageBack::requestDismiss) {
                                     Icon(Icons.Default.ArrowBack, contentDescription = stringResource(R.string.module_repo_back))
                                 }
                             }
@@ -456,78 +457,244 @@ private fun BuildModuleRepositoryScreenContent(
     val state by vm.uiState.collectAsState()
     val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
+    val coroutineScope = rememberCoroutineScope()
     val motionScheme = MaterialTheme.motionScheme
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(rememberTopAppBarState())
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var showRepositorySettings by rememberSaveable { mutableStateOf(false) }
+    val repositoryPageTransition = rememberChildPageOverlayTransition(
+        visible = showRepositorySettings,
+        label = "build-module-repository-settings"
+    )
     var pendingCatalogModule by remember { mutableStateOf<ModuleCatalogItem?>(null) }
     var selectedCatalogModuleStages by rememberSaveable { mutableStateOf(emptyList<String>()) }
-    var repositoryBackProgress by remember { mutableFloatStateOf(0f) }
-    val animatedRepositoryBackProgress by animateFloatAsState(
-        targetValue = repositoryBackProgress.coerceIn(0f, 1f),
-        animationSpec = motionScheme.fastSpatialSpec(),
-        label = "build-module-repository-back-progress"
-    )
-    val visualRepositoryBackProgress = animatedRepositoryBackProgress
-        .coerceIn(0f, 1f)
-        .pow(MODULE_REPOSITORY_BACK_VISUAL_EXPONENT)
-    val density = LocalDensity.current
-    val repositoryBackOffsetPx = with(density) { MODULE_REPOSITORY_BACK_MAX_OFFSET.toPx() }
-    val repositoryBackCorner = with(density) {
-        (MODULE_REPOSITORY_BACK_MAX_CORNER.toPx() * visualRepositoryBackProgress).toDp()
+    var pendingModuleSetMetadata by remember { mutableStateOf<ExternalModuleMetadata?>(null) }
+    var selectedModuleSetChildren by rememberSaveable { mutableStateOf(emptyList<String>()) }
+    var moduleSetStageSelections by remember { mutableStateOf<Map<String, List<String>>>(emptyMap()) }
+    val mergedModulesState by produceState(
+        initialValue = ModuleListComputation<BuildPageMergedCatalogModule>(
+            loading = state.buildModuleRepositories.isNotEmpty()
+        ),
+        key1 = state.buildModuleRepositories
+    ) {
+        if (state.buildModuleRepositories.isEmpty()) {
+            value = ModuleListComputation(items = emptyList(), loading = false)
+            return@produceState
+        }
+        value = ModuleListComputation(loading = true)
+        val merged = withContext(Dispatchers.Default) {
+            mergeBuildPageCatalogModules(state.buildModuleRepositories)
+        }
+        value = ModuleListComputation(items = merged, loading = false)
     }
-    val mergedModules = remember(state.buildModuleRepositories) {
-        mergeBuildPageCatalogModules(state.buildModuleRepositories)
+    val mergedModules = mergedModulesState.items
+    val filteredModulesState by produceState(
+        initialValue = ModuleListComputation<BuildPageMergedCatalogModule>(
+            loading = mergedModulesState.loading
+        ),
+        key1 = mergedModulesState,
+        key2 = searchQuery
+    ) {
+        if (mergedModulesState.loading) {
+            value = ModuleListComputation(loading = true)
+            return@produceState
+        }
+        value = ModuleListComputation(loading = true)
+        val filtered = withContext(Dispatchers.Default) {
+            if (searchQuery.isBlank()) {
+                mergedModules
+            } else {
+                mergedModules.filter { it.matchesQuery(searchQuery) }
+            }
+        }
+        value = ModuleListComputation(items = filtered, loading = false)
     }
-    val filteredModules = remember(mergedModules, searchQuery) {
-        mergedModules.filter { it.matchesQuery(searchQuery) }
-    }
+    val filteredModules = filteredModulesState.items
+    val listComputing = mergedModulesState.loading
     val selectedModules = remember(state.buildConfig.customExternalModules) {
         state.buildConfig.customExternalModules
             .map { it.url.trim().lowercase() to CustomExternalModuleStage.normalize(it.stage) }
             .toSet()
     }
 
-    fun openRepositorySettings() {
-        repositoryBackProgress = 0f
-        onRepositoryPageVisibleChange(true)
-        showRepositorySettings = true
-    }
-
     fun closeRepositorySettings() {
         showRepositorySettings = false
     }
 
-    LaunchedEffect(showRepositorySettings) {
-        if (showRepositorySettings) {
-            onRepositoryPageVisibleChange(true)
-        } else {
-            delay(MODULE_REPOSITORY_PAGE_EXIT_DELAY_MS)
-            repositoryBackProgress = 0f
-            onRepositoryPageVisibleChange(false)
-        }
+    val childPageBack = rememberChildPageBackController(
+        enabled = showRepositorySettings,
+        predictiveBackEnabled = state.predictiveBackEnabled,
+        onBack = ::closeRepositorySettings,
+    )
+
+    fun openRepositorySettings() {
+        childPageBack.resetProgress()
+        showRepositorySettings = true
     }
+
+    ObserveChildPageVisibility(
+        transition = repositoryPageTransition,
+        onVisibleChange = onRepositoryPageVisibleChange,
+        onAfterExitAnimation = { childPageBack.resetProgress() }
+    )
 
     DisposableEffect(Unit) {
         onDispose { onRepositoryPageVisibleChange(false) }
     }
 
-    PredictiveBackHandler(enabled = showRepositorySettings && state.predictiveBackEnabled) { progress ->
-        try {
-            progress.collect { backEvent ->
-                repositoryBackProgress = backEvent.progress.coerceIn(0f, 1f)
-            }
-            closeRepositorySettings()
-        } catch (_: CancellationException) {
-            repositoryBackProgress = 0f
-        }
-    }
-
-    BackHandler(enabled = showRepositorySettings && !state.predictiveBackEnabled) {
-        closeRepositorySettings()
-    }
-
     pendingCatalogModule?.let { module ->
+        if (module.kind == ModuleCatalogItemKind.MODULE_SET) {
+            val metadata = pendingModuleSetMetadata
+            if (metadata != null) {
+                val children = metadata.children
+                val addToBuildLabel = stringResource(R.string.module_repo_add_to_build)
+                AlertDialog(
+                    onDismissRequest = {
+                        pendingCatalogModule = null
+                        pendingModuleSetMetadata = null
+                        selectedModuleSetChildren = emptyList()
+                        moduleSetStageSelections = emptyMap()
+                    },
+                    icon = { Icon(Icons.Default.Extension, null) },
+                    title = { Text(module.buildDisplayName()) },
+                    text = {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 420.dp)
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Text(
+                                text = if (module.description.isNotBlank()) module.description else addToBuildLabel,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            children.forEach { child ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.Top,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Checkbox(
+                                        checked = child.id in selectedModuleSetChildren,
+                                        onCheckedChange = { checked ->
+                                            selectedModuleSetChildren = if (checked) {
+                                                (selectedModuleSetChildren + child.id).distinct()
+                                            } else {
+                                                selectedModuleSetChildren - child.id
+                                            }
+                                        }
+                                    )
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(child.name, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                                        if (child.description.isNotBlank()) {
+                                            Text(
+                                                child.description,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        if (child.id in selectedModuleSetChildren) {
+                                            val options = child.supportedStages
+                                            val initialStages = child.recommendedStages
+                                                .filter { it in options }
+                                                .ifEmpty { listOf(child.defaultStage) }
+                                            val selectedStages = moduleSetStageSelections[child.id] ?: initialStages
+                                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                                options.forEach { stage ->
+                                                    Row(
+                                                        modifier = Modifier.fillMaxWidth(),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                                    ) {
+                                                        Checkbox(
+                                                            checked = stage in selectedStages,
+                                                            onCheckedChange = { checked ->
+                                                                val updatedStages = if (checked) {
+                                                                    (selectedStages + stage).distinct()
+                                                                } else {
+                                                                    selectedStages - stage
+                                                                }
+                                                                moduleSetStageSelections = moduleSetStageSelections + (child.id to updatedStages)
+                                                            }
+                                                        )
+                                                        Text(
+                                                            text = buildString {
+                                                                append(stage)
+                                                                if (stage in child.recommendedStages) {
+                                                                    append(stringResource(R.string.module_repo_recommended))
+                                                                }
+                                                            },
+                                                            style = MaterialTheme.typography.bodySmall
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        Button(
+                            onClick = {
+                                val selections = children
+                                    .filter { it.id in selectedModuleSetChildren }
+                                    .map { child ->
+                                        child to (
+                                            moduleSetStageSelections[child.id]
+                                                ?.distinct()
+                                                ?.filter { stage -> stage in child.supportedStages }
+                                                ?.ifEmpty {
+                                                    child.recommendedStages
+                                                        .filter { stage -> stage in child.supportedStages }
+                                                        .ifEmpty { listOf(child.defaultStage) }
+                                                }
+                                                ?: child.recommendedStages
+                                                    .filter { stage -> stage in child.supportedStages }
+                                                    .ifEmpty { listOf(child.defaultStage) }
+                                        )
+                                    }
+                                    .filter { (_, stages) -> stages.isNotEmpty() }
+                                if (vm.replaceModuleSetSelection(module.repoUrl, metadata, selections)) {
+                                    pendingCatalogModule = null
+                                    pendingModuleSetMetadata = null
+                                    selectedModuleSetChildren = emptyList()
+                                    moduleSetStageSelections = emptyMap()
+                                    Toast.makeText(context, context.getString(R.string.module_repo_added_to_build), Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            enabled = selectedModuleSetChildren.isNotEmpty() && children
+                                .filter { it.id in selectedModuleSetChildren }
+                                .all { child ->
+                                    val selectedStages = moduleSetStageSelections[child.id]
+                                        ?: child.recommendedStages
+                                            .filter { stage -> stage in child.supportedStages }
+                                            .ifEmpty { listOf(child.defaultStage) }
+                                    selectedStages.any { stage -> stage in child.supportedStages }
+                                }
+                        ) {
+                            Text(stringResource(R.string.module_repo_add_selected))
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            onClick = {
+                                pendingCatalogModule = null
+                                pendingModuleSetMetadata = null
+                                selectedModuleSetChildren = emptyList()
+                                moduleSetStageSelections = emptyMap()
+                            }
+                        ) {
+                            Text(stringResource(R.string.cancel))
+                        }
+                    }
+                )
+            }
+            return@let
+        }
         val supportedStages = module.buildNormalizedSupportedStages()
         val recommendedStages = module.buildNormalizedRecommendedStages().toSet()
         val addedStages = module.addedStages(selectedModules).toSet()
@@ -640,7 +807,7 @@ private fun BuildModuleRepositoryScreenContent(
             .offset(y = -childPageTopInset)
 
         Scaffold(
-            containerColor = uiSurfaceColor(MaterialTheme.colorScheme.surface),
+            containerColor = appPageBackgroundColor(uiSurfaceColor(MaterialTheme.colorScheme.surface)),
             topBar = {
                 ExpressiveTopBar(
                     title = buildRepoTitleLabel(context),
@@ -657,6 +824,7 @@ private fun BuildModuleRepositoryScreenContent(
                 padding = padding,
                 modules = filteredModules,
                 totalModules = mergedModules.size,
+                computing = listComputing,
                 repositories = state.buildModuleRepositories,
                 refreshing = state.refreshingBuildModuleRepositoryIds.isNotEmpty(),
                 selectedModules = selectedModules,
@@ -664,8 +832,24 @@ private fun BuildModuleRepositoryScreenContent(
                 onSearchQueryChange = { searchQuery = it },
                 onOpenRepositorySettings = ::openRepositorySettings,
                 onAddModule = { module ->
-                    pendingCatalogModule = module
-                    selectedCatalogModuleStages = module.initialStageSelection(selectedModules)
+                    if (module.kind == ModuleCatalogItemKind.MODULE_SET) {
+                        coroutineScope.launch {
+                            val metadata = vm.checkCustomExternalModuleMetadata(module.repoUrl)
+                            if (metadata != null) {
+                                pendingCatalogModule = module
+                                pendingModuleSetMetadata = metadata
+                                selectedModuleSetChildren = metadata.children.map { it.id }
+                                moduleSetStageSelections = metadata.children.associate { child ->
+                                    child.id to child.recommendedStages
+                                        .filter { stage -> stage in child.supportedStages }
+                                        .ifEmpty { listOf(child.defaultStage) }
+                                }
+                            }
+                        }
+                    } else {
+                        pendingCatalogModule = module
+                        selectedCatalogModuleStages = module.initialStageSelection(selectedModules)
+                    }
                 },
                 onOpenModule = { module ->
                     val url = module.homepage.ifBlank { module.repoUrl }
@@ -677,38 +861,29 @@ private fun BuildModuleRepositoryScreenContent(
             )
         }
 
-        AnimatedVisibility(
-            visible = showRepositorySettings,
+        repositoryPageTransition.AnimatedVisibility(
+            visible = { it },
             enter = fadeIn(animationSpec = motionScheme.defaultEffectsSpec()),
-            exit = fadeOut(animationSpec = motionScheme.fastEffectsSpec()),
+            exit = childPageScrimExitTransition(state.predictiveBackEnabled, motionScheme),
             modifier = childPageModifier
         ) {
             Box(
                 Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = MODULE_REPOSITORY_BACK_SCRIM_ALPHA * visualRepositoryBackProgress))
+                    .background(Color.Black.copy(alpha = childPageBack.scrimAlpha))
             )
         }
 
-        AnimatedVisibility(
-            visible = showRepositorySettings,
-            enter = fadeIn(animationSpec = motionScheme.defaultEffectsSpec()) +
-                slideInHorizontally(animationSpec = motionScheme.defaultSpatialSpec()) { width -> width / 4 },
-            exit = fadeOut(animationSpec = motionScheme.fastEffectsSpec()) +
-                slideOutHorizontally(animationSpec = motionScheme.fastSpatialSpec()) { width -> width },
+        repositoryPageTransition.AnimatedVisibility(
+            visible = { it },
+            enter = childPageOverlayEnterTransition(state.predictiveBackEnabled, motionScheme),
+            exit = childPageOverlayExitTransition(state.predictiveBackEnabled, motionScheme),
             modifier = childPageModifier
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .graphicsLayer {
-                        translationX = repositoryBackOffsetPx * visualRepositoryBackProgress
-                        scaleX = 1f - MODULE_REPOSITORY_BACK_SCALE_DELTA * visualRepositoryBackProgress
-                        scaleY = 1f - MODULE_REPOSITORY_BACK_SCALE_DELTA * visualRepositoryBackProgress
-                        alpha = 1f - 0.06f * visualRepositoryBackProgress
-                        shape = RoundedCornerShape(repositoryBackCorner)
-                        clip = visualRepositoryBackProgress > 0.01f
-                    }
+                    .then(childPageBack.backTransformModifier())
             ) {
                 ModuleRepositoryPageBackground(
                     backgroundUri = state.customBackgroundUri,
@@ -720,7 +895,7 @@ private fun BuildModuleRepositoryScreenContent(
                         ExpressiveTopBar(
                             title = buildRepoCentralLabel(context),
                             navigationIcon = {
-                                IconButton(onClick = ::closeRepositorySettings) {
+                                IconButton(onClick = childPageBack::requestDismiss) {
                                     Icon(Icons.Default.ArrowBack, contentDescription = stringResource(R.string.module_repo_back))
                                 }
                             }
@@ -747,6 +922,7 @@ private fun RuntimeModuleRepositoryListContent(
     padding: PaddingValues,
     modules: List<MergedRuntimeCatalogModule>,
     totalModules: Int,
+    computing: Boolean,
     repositories: List<RuntimeModuleRepository>,
     refreshing: Boolean,
     searchQuery: String,
@@ -757,33 +933,52 @@ private fun RuntimeModuleRepositoryListContent(
     scrollBehavior: androidx.compose.material3.TopAppBarScrollBehavior,
     bottomPadding: Dp
 ) {
-    Column(
+    val showInitialLoading = computing || (refreshing && totalModules == 0 && searchQuery.isBlank())
+    LazyColumn(
         modifier = Modifier
             .padding(padding)
             .fillMaxSize()
             .nestedScroll(scrollBehavior.nestedScrollConnection)
-            .verticalScroll(rememberScrollState())
             .padding(horizontal = AbkScreenHorizontalPadding),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        contentPadding = PaddingValues(bottom = bottomPadding + 24.dp)
     ) {
-        CompactModuleSearchField(
-            value = searchQuery,
-            onValueChange = onSearchQueryChange
-        )
-
-        if (refreshing) {
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        item(key = "search") {
+            CompactModuleSearchField(
+                value = searchQuery,
+                onValueChange = onSearchQueryChange
+            )
         }
 
-        if (modules.isEmpty()) {
-            RuntimeModuleRepositoryEmptyState(
-                totalModules = totalModules,
-                repositoryCount = repositories.size,
-                hasQuery = searchQuery.isNotBlank(),
-                onOpenRepositorySettings = onOpenRepositorySettings
-            )
+        if (refreshing && !showInitialLoading) {
+            item(key = "refreshing") {
+                ShimmerLinearProgress(
+                    progress = { null },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+
+        if (showInitialLoading) {
+            item(key = "initial-loading") {
+                ModuleRepositoryInitialLoading()
+            }
+        } else if (modules.isEmpty()) {
+            item(key = "empty") {
+                RuntimeModuleRepositoryEmptyState(
+                    totalModules = totalModules,
+                    repositoryCount = repositories.size,
+                    hasQuery = searchQuery.isNotBlank(),
+                    onOpenRepositorySettings = onOpenRepositorySettings
+                )
+            }
         } else {
-            modules.forEach { merged ->
+            items(
+                items = modules,
+                key = { merged ->
+                    "${merged.module.id.trim().lowercase().ifBlank { merged.module.name.trim().lowercase() }}-${merged.sources.joinToString("|")}"
+                }
+            ) { merged ->
                 RuntimeModuleRepositoryListItem(
                     merged = merged,
                     onOpen = { onOpenModule(merged) },
@@ -791,8 +986,28 @@ private fun RuntimeModuleRepositoryListContent(
                 )
             }
         }
+    }
+}
 
-        Spacer(Modifier.height(bottomPadding + 24.dp))
+@Composable
+private fun ModuleRepositoryInitialLoading() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 48.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            LoadingIndicator(Modifier.size(42.dp))
+            Text(
+                text = stringResource(R.string.module_repo_building_list),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
     }
 }
 
@@ -1159,7 +1374,10 @@ private fun RuntimeModuleRepositoryCard(
         icon = Icons.Default.Dns
     ) {
         if (refreshing) {
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            ShimmerLinearProgress(
+                progress = { null },
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -1392,32 +1610,10 @@ private fun ModuleRepositoryPageBackground(
     backgroundUri: String?,
     backgroundImageEnabled: Boolean
 ) {
-    val colorScheme = MaterialTheme.colorScheme
-    val hasBackground = backgroundImageEnabled && !backgroundUri.isNullOrBlank()
-    val scrimColor = if (colorScheme.surface.luminance() > 0.5f) {
-        colorScheme.surface.copy(alpha = 0.28f)
-    } else {
-        Color.Black.copy(alpha = 0.38f)
-    }
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(colorScheme.surface)
-    ) {
-        if (hasBackground) {
-            AsyncImage(
-                model = backgroundUri,
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize()
-            )
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(scrimColor)
-            )
-        }
-    }
+    AppPageBackground(
+        backgroundUri = backgroundUri,
+        backgroundImageEnabled = backgroundImageEnabled
+    )
 }
 
 private data class MergedRuntimeCatalogModule(
@@ -1525,6 +1721,7 @@ private fun BuildModuleRepositoryListContent(
     padding: PaddingValues,
     modules: List<BuildPageMergedCatalogModule>,
     totalModules: Int,
+    computing: Boolean,
     repositories: List<ModuleCatalogRepository>,
     refreshing: Boolean,
     selectedModules: Set<Pair<String, String>>,
@@ -1537,56 +1734,75 @@ private fun BuildModuleRepositoryListContent(
     bottomPadding: Dp
 ) {
     val context = LocalContext.current
-    Column(
+    val showInitialLoading = computing || (refreshing && totalModules == 0 && searchQuery.isBlank())
+    LazyColumn(
         modifier = Modifier
             .padding(padding)
             .fillMaxSize()
             .nestedScroll(scrollBehavior.nestedScrollConnection)
-            .verticalScroll(rememberScrollState())
             .padding(horizontal = AbkScreenHorizontalPadding),
-        verticalArrangement = Arrangement.spacedBy(10.dp)
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+        contentPadding = PaddingValues(bottom = bottomPadding + 24.dp)
     ) {
-        CompactModuleSearchField(
-            value = searchQuery,
-            onValueChange = onSearchQueryChange
-        )
-
-        if (refreshing) {
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        item(key = "search") {
+            CompactModuleSearchField(
+                value = searchQuery,
+                onValueChange = onSearchQueryChange
+            )
         }
 
-        if (modules.isEmpty()) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 28.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Extension,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(38.dp)
+        if (refreshing && !showInitialLoading) {
+            item(key = "refreshing") {
+                ShimmerLinearProgress(
+                    progress = { null },
+                    modifier = Modifier.fillMaxWidth(),
                 )
-                Text(
-                    text = when {
-                        searchQuery.isNotBlank() -> context.getString(R.string.module_repo_no_matching)
-                        repositories.isEmpty() -> buildRepoEmptyTitleLabel(context)
-                        totalModules == 0 -> context.getString(R.string.module_repo_refresh_hint)
-                        else -> context.getString(R.string.module_repo_no_display)
-                    },
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                TextButton(onClick = onOpenRepositorySettings) {
-                    Icon(Icons.Default.Dns, null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(buildRepoManageLabel(context))
+            }
+        }
+
+        if (showInitialLoading) {
+            item(key = "initial-loading") {
+                ModuleRepositoryInitialLoading()
+            }
+        } else if (modules.isEmpty()) {
+            item(key = "empty") {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 28.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Extension,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(38.dp)
+                    )
+                    Text(
+                        text = when {
+                            searchQuery.isNotBlank() -> context.getString(R.string.module_repo_no_matching)
+                            repositories.isEmpty() -> buildRepoEmptyTitleLabel(context)
+                            totalModules == 0 -> context.getString(R.string.module_repo_refresh_hint)
+                            else -> context.getString(R.string.module_repo_no_display)
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    TextButton(onClick = onOpenRepositorySettings) {
+                        Icon(Icons.Default.Dns, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(buildRepoManageLabel(context))
+                    }
                 }
             }
         } else {
-            modules.forEach { merged ->
+            items(
+                items = modules,
+                key = { merged ->
+                    merged.module.repoUrl.trim().lowercase()
+                }
+            ) { merged ->
                 val module = merged.module
                 val supportedStages = module.buildNormalizedSupportedStages()
                 val allStagesAdded = supportedStages.all { stage ->
@@ -1706,8 +1922,6 @@ private fun BuildModuleRepositoryListContent(
                 }
             }
         }
-
-        Spacer(Modifier.height(bottomPadding + 24.dp))
     }
 }
 
@@ -1809,7 +2023,10 @@ private fun BuildModuleCatalogRepositoryCard(
         icon = Icons.Default.Dns
     ) {
         if (refreshing) {
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            ShimmerLinearProgress(
+                progress = { null },
+                modifier = Modifier.fillMaxWidth(),
+            )
         }
         Row(
             verticalAlignment = Alignment.CenterVertically,
